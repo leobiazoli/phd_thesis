@@ -1,0 +1,23 @@
+---
+title: "Research"
+---
+
+## Description
+
+### Thesis project: Strategies for infer from a huge collection of bibliometric data
+
+The phenomenon of international migration of researchers plays a significant role in the globalized scenario, potentially resulting in the flight or acquisition of talent in terms of human capital for the countries involved. This dynamic can affect the socio-economic and innovative development of nations, posing challenges for researchers and policymakers. The aim of this study is therefore to assess the effect of international migration on the academic careers of Brazilian researchers in the field of health, considering the movements made between 2005 and 2020. The database used to achieve the objectives refers to bibliometric data from Scopus, which can be extracted via API. This database contains the information of each article in one line and totals more than 600,000 observations (articles) for the period from 2005 to 2020, for Brazilian health researchers.
+
+## **Objectives**
+
+The general objective of this study is to evaluate the effect of international migration on the academic careers of Brazilian researchers in the health field, considering the movements made between 2005 and 2020. To this end, it will seek to answer the following question: "Are there differences in the impact and quality of publications by Brazilian researchers before and after the migration movement?"
+
+## Schedule
+
+The work in partnership with Professor Mine Cetinkaya-Rundel is scheduled to take place between April and July 2024 at Duke University. The stages of the project to be developed during this period are listed below.
+
+**Stage 1 - Studies and preparation of databases**
+
+**Stage 2 - Descriptive analysis and data visualization**
+
+## 

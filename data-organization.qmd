@@ -1,0 +1,408 @@
+---
+title: "Data organization"
+bibliography: references.bib
+editor_options: 
+  chunk_output_type: console
+execute: 
+  eval: false
+format:
+  html:
+    code-fold: true
+    code-tools: true
+---
+
+## Loading packages
+
+```{r}
+#| eval: false
+#| label: load-packages
+#| warning: false
+library(tidyverse)
+library(fs)
+library(readr)
+library(purrr)
+library(dplyr)
+library(furrr)
+library(lubridate)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(arrow)
+# install.packages('arrow', repos = c('https://apache.r-universe.dev'))
+```
+
+## Step 1: Reading CSV files
+
+For the first step, we need to read all the CSV files (each of these files represents an author with each line being an article). The number of files (over 400,000) meant that we couldn't do this efficiently with the `read_csv()` [@readr] and `map_dfr()` [@purrr] functions.
+
+An alternative used to read all the files was to use the `arrow` package [@arrow], which is able to read and write CSV files with excellent speed and efficiency.
+
+Using `arrow` package:
+
+1.  Create a list of CSV files and remove the empty ones;
+2.  Indicate variable types with `schema()` function;
+3.  Use `open_dataset()` to read without using R memory.
+
+```{r}
+#| eval: false
+path2 <- "/Users/Usuario/Desktop/authors" 
+
+files_csv2 <- list.files(path = path2, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+
+files_csv_cp <- Filter(function(arquivo) file.size(arquivo) > 3, files_csv2)
+
+schema2 <- schema(
+  field("", type = string()),
+  field("eid", type = string()),
+  field("doi", type = string()),
+  field("pii", type = string()),
+  field("pubmed_id", type = string()),
+  field("title", type = string()),
+  field("subtype", type = string()),
+  field("subtypeDescription", type = string()),
+  field("creator", type = string()),
+  field("afid", type = string()),
+  field("affilname", type = string()),
+  field("affiliation_city", type = string()),
+  field("affiliation_country", type = string()),
+  field("author_count", type = int64()),     
+  field("author_names", type = string()),
+  field("author_ids", type = string()),
+  field("author_afids", type = string()),
+  field("coverDate", type = date32()),
+  field("coverDisplayDate", type = string()),
+  field("publicationName", type = string()),
+  field("issn", type = string()),
+  field("source_id", type = int64()),
+  field("eIssn", type = string()),
+  field("aggregationType", type = string()),
+  field("volume", type = string()),
+  field("issueIdentifier", type = string()),
+  field("article_number", type = string()),
+  field("pageRange", type = string()),
+  field("description", type = string()),
+  field("authkeywords", type = string()),
+  field("citedby_count", type = int64()),
+  field("openaccess", type = int64()),
+  field("freetoread", type = string()),
+  field("freetoreadLabel", type = string()),
+  field("fund_acr", type = string()),
+  field("fund_no", type = string()),
+  field("fund_sponsor", type = string())
+)
+
+dataset <- arrow::open_dataset(
+  files_csv_cp, 
+  format = "csv",
+  col_types = schema2
+) 
+
+```
+
+After reading the data with `open_dataset()`, the `dplyr` library [@dplyr] was used to organize the database:
+
+1.  Selecting the variables to be used in the data analysis;
+2.  Creating a variable to indicate the year of each publication (`publication_year`);
+3.  Selection of publications from 2000 to 2020;
+4.  Transformation of the object into `data.frame` for better manipulation of future analyses;
+5.  Removing duplicate lines.
+
+```{r}
+#| eval: false
+data_process1 <- dataset |>
+  select(c(doi, title, afid, affilname, affiliation_city, affiliation_country, author_count, author_names, author_ids, author_afids, coverDate, publicationName, issn, citedby_count, eid, source_id, subtype)) |>
+  mutate(publication_year = year(ymd(coverDate))) |>
+  filter(publication_year %in% 2000:2020) |>
+  as.data.frame() |>
+  distinct(eid, .keep_all = TRUE) 
+
+# 30th May - 4.045.561 obs. of 18 variables
+save(data_process1, file="data_process1.rda")
+```
+
+## Step 2: Data organization
+
+For the second stage, we need information on each author by line (country). In addition, at this stage we can add a list of the countries they are related to.
+
+1.  Creating two new columns to receive the codes of each author and the code of their affiliation (`author_id` and `author_id`);
+
+2.  Separating the author codes by line `(author_ids, author_afids)` and removing authors with empty affiliations;
+
+3.  Selection of author codes only from the original base;
+
+4.  Using the `get_dupes()` function to select authors with more than one publication and saving a database with the authors of a single publication [@janitor];
+
+5.  Separating authors with multiple affiliations `(delim = “-”)`;
+
+6.  Saving the final database in which each line represents an author with a publication affiliation.
+
+```{r}
+#| eval: false
+# STEP 1 and 2---------------------------------------------------------------------------
+load(file="data_process1.rda")
+
+data_process1$author_id <- data_process1$author_ids
+data_process1$author_afid <- data_process1$author_afids
+
+data_process2 <- data_process1 |>
+   select(-c(author_names)) |> # deixei coverDate
+   separate_longer_delim(c(author_id, author_afid), delim = ";") |>
+   filter(author_afid != "")
+
+# 26.222.562 obs. of 17 vars
+save(data_process2, file="data_process2.rda")
+
+load(file="data_process2.rda")
+
+# STEP 3---------------------------------------------------------------------------------
+path2 <- "/Users/Usuario/Desktop/authors"
+
+files_csv2 <- list.files(path = path2, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+
+files_csv_cp <- Filter(function(arquivo) file.size(arquivo) > 3, files_csv2)
+
+codes_str <- str_extract(files_csv_cp, "(?<=/)[^/]+(?=\\.csv)")
+
+data_process3 <- data_process2 |>
+   filter(author_id %in% codes_str)
+
+save(data_process3, file="data_process3.rda")
+
+# dataframe: select only authors with names in CSV (7.164.576 obs. of 19 vars)
+load(file="data_process3.rda")
+
+# STEP 4---------------------------------------------------------------------------------
+# filtering article (ar) and review (re)
+data_process3_2 <- data_process3 |>
+  filter(subtype %in% c("ar","re"))
+
+data_process4 <- data_process3_2 |>
+  get_dupes(author_id) |>
+  select(-dupe_count)
+
+df_g0 <- setdiff(data_process3_2, data_process4)
+
+# dataframe with authors of single article (122.966 obs. of 19 vars)
+save(df_g0, file = "df_g0.rda")
+save(data_process4, file = "data_process4.rda")
+# STEP 5---------------------------------------------------------------------------------
+data_process5 <- data_process4 |>
+   separate_longer_delim(author_afid, delim = "-")
+
+# last dataframe with an article by row and publication and affiliation (less author single article - 7.158.814 obs. of 19 vars)
+save(data_process5, file="data_process5.rda")
+```
+
+## Step 3: Classifying mobility groups
+
+In the third stage, we need to separate only the authors with some affiliation to Brazil between 2000 and 2020 so that we can then find the descriptive statistics of the academic mobility groups. This classification was made only with the publications of articles ("ar") and reviews ("re").
+
+1.  Classification of authors into groups:
+    0)  single article researcher (author of a single publication);
+    1)  non-migrant researcher (no evidence of international mobility);
+    2)  immigrant researcher (initial affiliation: other countries, final affiliation: Brazil);
+    3)  emigrant researcher (initial affiliation: Brazil, final affiliation: other countries);
+    4)  returning migrant researcher (initial affiliation: Brazil, transitional affiliation: other countries, final affiliation: Brazil);
+    5)  transient migrant researcher (initial affiliation: other countries, transitional affiliation: Brazil, final affiliation: other countries).
+
+```{r}
+#| eval: false
+# STEP 1---------------------------------------------------------------------------------
+load(file="data_process5.rda")
+
+# filtering article (ar) and review (re)
+# data_process5_2 <- data_process5 |>
+#   filter(subtype %in% c("ar","re"))
+# AQUI PRECISO TIRAR QUEM TEM MAIS DE 2 PUB
+
+# add country
+afid_affiliation_country_lookup_all <- data_process5 |>
+  select(afid, affiliation_country) |>
+  separate_longer_delim(c(afid, affiliation_country), delim = ";") |>
+  distinct(afid, affiliation_country)
+
+big_data <- data_process5 |>
+  left_join(afid_affiliation_country_lookup_all, join_by(author_afid == afid)) |> 
+  filter(!is.na(affiliation_country.y)) |>
+  filter(affiliation_country.y != "") 
+
+# classifying into groups
+result <- big_data |>
+  group_by(author_id) |>
+  arrange(author_id, publication_year) |>
+  reframe(
+    countries = list(affiliation_country.y),  
+    country_uniq = toString(unique(affiliation_country.y))) |>
+  mutate(
+    groups_c = case_when(
+      (str_count(country_uniq, pattern = ",") + 1) == 1 & country_uniq == "Brazil" ~ "1",
+      sapply(countries, head, 1) != "Brazil" & sapply(countries, tail, 1) == "Brazil" ~ "2",
+      sapply(countries, head, 1) == "Brazil" & sapply(countries, tail, 1) != "Brazil" ~ "3",
+      sapply(countries, head, 1) == "Brazil" & sapply(countries, tail, 1) == "Brazil" ~ "4",
+      TRUE ~ "5"
+    )
+  ) |> filter(grepl("Brazil", country_uniq))
+
+data_process6 <- big_data |>
+  inner_join(result, join_by(author_id))
+
+save(data_process6, file = "data_process6.rda")
+```
+
+## Step 4: Adding academic journal metrics
+
+At this stage we added the SJR (SCImago Journal Rank) metric to the final data to help with future statistical analysis and the construction of statistical models.
+
+The database was taken from the [SJR website](https://www.scimagojr.com) and organized as shown in the code below.
+
+::: {.callout-note icon="false"}
+## SJR (SCImago Journal Rank)
+
+The SJR indicator is a size-independent metric aimed at measuring the current "average prestige per paper" of journals for use in research evaluation processes.
+:::
+
+```{r}
+#| eval: false
+load(file = "data_process6.rda")
+
+# Function to read the SJR files and select the necessary columns
+process_sjr_file <- function(file_path, year) {
+  sjr_data <- read_delim(file_path, delim = ";", escape_double = FALSE, trim_ws = TRUE)
+  
+  sjr_data$SJR <- as.numeric(gsub(",", ".", sjr_data$SJR))
+  
+  sjr_data <- sjr_data %>%
+    select(c("Sourceid", "Title", "Issn", "SJR", "Country", "Categories", "Areas" ))
+  
+  sjr_data <- sjr_data %>%
+    mutate(Year = year)
+  
+  return(sjr_data)
+}
+
+# Vector with file paths
+path2 <- "sjr" 
+
+file_paths <- list.files(path = path2, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+
+# List for storing processed DataFrames
+processed_data <- list()
+
+# Loop to process each file
+for (file_path in file_paths) {
+  year <- sub(".*scimagojr ([0-9]{4}).csv", "\\1", file_path)  # Extracts the year from the file name
+  year <- as.numeric(year)
+  processed_data[[year]] <- process_sjr_file(file_path, year)
+}
+
+# Combine all DataFrames into a single DataFrame
+sjr_journals <- bind_rows(processed_data)
+
+save(sjr_journals, file = "sjr_journals.rda")
+
+load(file = "sjr_journals.rda")
+
+data_process6$source_id <- as.numeric(data_process6$source_id)
+
+data_process7 <- data_process6 |>
+  left_join(sjr_journals, by = join_by(source_id == Sourceid, publication_year == Year))
+
+save(data_process7, file = "data_process7.rda")
+```
+
+## Step 5: Cleaning data
+
+This last step serves to remove some unused variables (“dupe_count”, “Country”, “subtype”), rename the columns and remove publications without an SJR classification.
+
+```{r}
+#| eval: false
+load(file = "data_process7.rda")
+
+data_process8 <- data_process7 |>
+  select(-c("Country", "subtype")) |>
+  rename(affiliation_country = affiliation_country.x,
+        country_year_pub = affiliation_country.y,
+        publicationName_sjr = Title,
+        issn_sjr = Issn)
+
+# Data completeness
+map(data_process8, ~sum(is.na(.)))
+
+# data_final_1 <- data_process8 |>
+#   filter(!is.na(SJR)) 
+
+# 3.222.784 rows and 27 vars
+save(data_process8, file = "data_process8.rda")
+```
+
+Adjustments were made to the database with the authors of single articles to then combine with the final data classified by type of mobility and perform the descriptive analyses.
+
+```{r}
+load("df_g0.rda")
+load(file = "sjr_journals.rda")
+
+df_g0$source_id <- as.numeric(df_g0$source_id)
+
+df_g0_2 <- df_g0 |>
+  filter(subtype %in% c("ar","re")) |>
+  left_join(sjr_journals, by = join_by(source_id == Sourceid, 
+  publication_year == Year)) |>
+  select(-c("Country", "subtype")) |>
+  rename(publicationName_sjr = Title,
+        issn_sjr = Issn) |>
+  dplyr::mutate(groups_c = "0") #|>
+  #filter(!is.na(SJR)) 
+
+# 122.966 rows and 24 vars
+save(df_g0_2, file = "df_g0_2.rda")
+
+# Final Data: 3.345.750 rows and 27 vars
+library(plyr)
+data_final <- rbind.fill(df_g0_2, data_process8)
+save(data_final, file = "data_final.rda")
+```
+
+## Step 6: Creating variables
+
+Nesta etapa iremos criar uma variável que indica a colaboração internacional em cada publicação. Se o artigo contar com pelo menos um autor estrageiro, a variável `foreign_country` é igual a 1, caso contrário a variável é 0.
+
+Posteriormente será criada uma variável com o tempo de publicação de cada artigo (`time_pub`) juntamente com outra variável para indicar o número de citações padronizadas pelo tempo (`cit_standard`).
+
+```{r}
+#| eval: false
+
+load(file = "data_final.rda")
+# Passo 1: Dividir a coluna affiliation_country em uma lista de países
+df_filtered_1 <- data_final |>
+  mutate(affiliation_list = str_split(affiliation_country, ";")) |>
+  mutate(affiliation_list = lapply(affiliation_list, function(countries) {
+    countries <- countries[countries != "Brazil"]  # Remove "Brazil"
+    countries <- countries[countries != ""]        # Remove valores vazios
+    return(countries)
+  }))
+
+# Passo 2: Contar o número de países diferentes de "Brazil" em cada linha
+df_filtered_2 <- df_filtered_1 |>
+  mutate(num_foreign_countries = sapply(affiliation_list, length)) |>
+  mutate(foreign_country = ifelse(num_foreign_countries > 0, 1, 0)) |>
+  select(-c(num_foreign_countries, affiliation_list))
+
+# Passo 3: Criar a variável de tempo da publicacao e da citacao padronizada
+data_final_up <- df_filtered_2 |>
+  mutate(time_pub = 2023 - publication_year) |>
+  mutate(cit_standard = citedby_count/time_pub)
+
+save(data_final_up, file = "data_final_up.rda")
+load(file = "data_final_up.rda")
+```
+
+## Data overview
+
+The data to be used in the statistical analysis is presented below.
+
+```{r}
+load(file = "data_final_up.rda")
+
+data_final_up |> 
+  glimpse()
+```

@@ -1,0 +1,31 @@
+project:
+  type: website
+  output-dir: _site
+
+publish:
+  method: gh-pages
+  branch: gh-pages
+
+website:
+  title: "Strategies for infer from a huge collection of bibliometric data"
+  sidebar:
+    style: "docked"
+    search: true
+    contents:
+      - section: "PhD Thesis"
+        contents:
+          - href: index.qmd
+          - href: about.qmd
+          - href: database.qmd
+          - href: data-organization.qmd
+          - href: data-exploratory.qmd
+          - href: data-exploratory-2.qmd
+
+      
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: true
+
+editor: visual

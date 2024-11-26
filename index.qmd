@@ -1,0 +1,17 @@
+---
+title: "Home"
+---
+
+## About
+
+**Leonardo Biazoli** (he/him) is Professor of the Actuarial Science at Federal University of Alfenas and PhD Student at the Department of Statistical Science at Federal University of Lavras. Leonardo's work focuses on causal inference and quasi-experimental models, with an emphasis on impact assessment models (i.e. synthetic control, regression discontinuity and interrupted time series). Leonardo is also interested in the areas of data wrangling and visualization.
+
+![](images/foto-perf.jpg){style="float:right;padding: 0 0 0 10px;" fig-align="right" width="110"}
+
+-   BS in Actuarial Science at Federal University of Alfenas ([UNIFAL](https://www.unifal-mg.edu.br/varginha/)) in 2020
+
+-   Master's Degree in Statistics at Federal University of Lavras ([UFLA](https://sigaa.ufla.br/sigaa/public/programa/portal.jsf?lc=en_US&id=1702)) in 2022
+
+-   PhD Student in Statistics at Federal University of Lavras ([UFLA](https://sigaa.ufla.br/sigaa/public/programa/portal.jsf?lc=en_US&id=1702))
+
+### 

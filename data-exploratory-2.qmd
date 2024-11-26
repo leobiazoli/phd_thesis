@@ -1,0 +1,1349 @@
+---
+title: "Synthetic Control"
+bibliography: references.bib
+editor_options: 
+  chunk_output_type: console
+format:
+  html:
+    code-fold: true
+    code-tools: true
+---
+
+```{r}
+#| echo: false
+#| message: false
+library(tidyverse)
+library(readr)
+library(purrr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(arrow)
+library(kableExtra)
+library(rmarkdown)
+library(tibble)
+library(DescTools)
+library(gsynth)
+#library(gtExtras)
+# Matching algorithm
+library(MatchIt)
+```
+
+## Introduction
+
+This stage includes exploratory data analysis (EDA) with the aim of analyzing and investigating the data set and summarizing its main characteristics.
+
+-   **Descriptive statistics by author:**
+    1.  Total publications (`n_articles`)
+    2.  Total citations (`n_citations`)
+    3.  Total number of countries by author (`n_countries`)
+    4.  Average number of citations (`mean_citation`)
+    5.  Max of citations (`max_citation`)
+    6.  Author group (`groups_c`)
+    7.  Number of international collaboration (`collab`)
+
+```{r}
+data_final_up |>
+  group_by(author_id, publication_year) |>
+  summarise(
+    n_articles = n_distinct(eid),
+    n_citations = sum(cit_standard),
+    n_countries = n_distinct(country_year_pub),
+    mean_citation = mean(cit_standard),
+    max_citation = max(cit_standard),
+    groups = unique(groups_c),
+    collab = sum(foreign_country)
+  ) |> 
+  paged_table()
+```
+
+Descriptive statistics of authors with publications from 2000 to 2020 in Brazil by groups of migratory movements (the groups were defined in Step 3 in Data Organization[^1]):
+
+[^1]: Classification of authors into groups:
+
+    0)  single article researcher;
+    1)  non-migrant researcher;
+    2)  immigrant researcher;
+    3)  emigrant researcher;
+    4)  returning migrant researcher;
+    5)  transient migrant researcher.
+
+<!-- -->
+
+**(1) Citation statistics by group**
+
+```{r}
+data_summary <- data_final_up |>
+  group_by(groups_c) |>
+  summarize(mean = mean(cit_standard), sd = sd(cit_standard),
+    cit_data = list(cit_standard),
+    .groups = "drop"
+  )
+
+data_summary |>
+    arrange(groups_c) |> 
+    gt() |>
+    gtExtras::gt_plt_dist(cit_data, type = "histogram", line_color = "blue", 
+                          fill_color = "red") |>
+    fmt_number(columns = mean:sd, decimals = 1)
+
+data_final_up |>
+  group_by(author_id, groups_c) |>
+  summarise(collab = sum(foreign_country)) |>
+  group_by(groups_c) |>
+  summarise(mean_collab = round(mean(collab),2),
+            sd_collab = round(sd(collab),2)) |> kable("pipe")
+
+data_final_up |>
+  group_by(groups_c) |>
+  summarise(
+    mean_citation = round(mean(cit_standard), 2),
+    sd_citation = round(sd(cit_standard), 2),
+    mean_sjr = round(mean(SJR, na.rm = T), 2),
+    sd_sjr = round(sd(SJR, na.rm = T), 2),
+    mean_collab = round(mean(foreign_country), 2),
+    sd_collab = round(sd(foreign_country), 2),
+    n_articles = n_distinct(eid),
+    n = n_distinct(author_id)
+  ) |> kable("pipe")
+```
+
+**(2) Publications by group and year**
+
+```{r}
+data_final_up |>
+  group_by(publication_year, groups_c) |>
+  summarise(articles = n_distinct(eid)) |>
+  ggplot(aes(x = publication_year, y = articles)) +
+  geom_bar(stat = "identity", fill = "navy") +  
+  labs(x = "Publication year", 
+       y = "Number of articles") +
+  theme_classic() +
+  facet_wrap(~ groups_c, scales = "free_y") 
+```
+
+**(3) Citation statistics by group**
+
+```{r}
+data_final_up |>
+  distinct(eid, groups_c, cit_standard) |>
+  group_by(groups_c) |>
+  summarise(mean_citation = mean(cit_standard),
+            median_citation = median(cit_standard),
+            min_citation = min(cit_standard),
+            max_citation = max(cit_standard),
+            sd_citation = sd(cit_standard)) |>
+  mutate(group_label = case_when(
+    groups_c == '0' ~ 'Single article',
+    groups_c == '1' ~ 'Non-migrant',
+    groups_c == '2' ~ 'Immigrant',
+    groups_c == '3' ~ 'Emigrant',
+    groups_c == '4' ~ 'Returning migrant',
+    TRUE ~ 'Transient migrant'
+  )) |>
+  paged_table()
+```
+
+**(4) Autores outliers**
+
+```{r}
+data_final_up |>
+  filter(groups_c != "0") |>
+  group_by(author_id) |>
+  summarise(
+    n_articles = n_distinct(eid),
+    groups = unique(groups_c)
+  ) |> #filter(n_articles > 20)
+  ggplot(aes(x = groups, y = n_articles)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue") +
+  labs(x = "Groups",
+       y = "Number of Articles") +
+  theme_classic()
+```
+
+**(5) Mean of citation by author**
+
+```{r}
+#| warning: false
+#| message: false
+data_final_up |>
+  group_by(author_id, groups_c) |>
+  summarise(
+    media_citacoes = mean(cit_standard, na.rm = TRUE),
+    num_artigos = n_distinct(eid)) |>
+  arrange(desc(media_citacoes)) |>
+  head(10) |>
+  paged_table()
+```
+
+## Data preparation for causal inference models
+
+Para ajuste dos modelos de inferencia causal os dados foram agrupados por autor (`author_id`) e ano (`publication_year`) no `data_prep`.
+
+```{r}
+#| eval: false
+# 1.307.391 obs and 12 vars
+data_prep <- data_final_up |>
+  group_by(author_id, publication_year) |>
+  summarise(n_articles = n_distinct(eid),
+            n_countries = n_distinct(country_year_pub),
+            n_citations = sum(cit_standard),
+            citation_mean = mean(cit_standard),
+            citation_max = max(cit_standard),
+            sjr_mean = mean(SJR),
+            sjr_max = max(SJR),
+            groups = unique(groups_c),
+            collab = sum(foreign_country),
+            country2 = list(country_year_pub))
+
+data_prep <- data_prep |>
+  mutate(
+    # Para cada linha, escolha o primeiro país diferente de "Brazil", se existir
+    country = sapply(country2, function(x) {
+      countries <- unlist(strsplit(x, ", "))  # Divide a lista de países em vetores
+      selected_country <- countries[countries != "Brazil"]  # Seleciona países diferentes de "Brazil"
+      if (length(selected_country) > 0) {
+        return(selected_country[1])  # Retorna o primeiro país diferente de "Brazil"
+      } else {
+        return(countries[1])  # Se não houver, retorna o primeiro país (que é "Brazil")
+      }
+    })
+  ) |>
+  select(-c(country2))
+
+data_prep |>
+  group_by(author_id, publication_year) |>
+  filter(n() == 1) |> view()
+
+save(data_prep, file = "data_prep.rda")
+
+data_prep |>
+  group_by(groups) |>
+  summarise(authors = n_distinct(author_id))
+
+# Na base final ainda tem autores com uma publicacao por ano sem ser do grupo 0, pois as publicacoes sem país foram retiradas.
+# Além disso, é necessário desconsiderar os autores com mais de uma publicacao em um único ano
+
+data_prep2 <- data_prep |>
+  filter(groups != "0") |>
+  group_by(author_id) |>
+  mutate(year_count = n_distinct(publication_year)) |>
+  filter(year_count > 1) |>
+  ungroup() |>
+  select(-year_count) 
+
+data_models <- data_prep2 |>
+  group_by(publication_year) |>
+  mutate(citations_winsorized = Winsorize(citation_mean, probs = c(0, 0.99))) |>
+  mutate(sjr_winsorized = Winsorize(sjr_mean, probs = c(0, 0.99), na.rm = T))
+
+save(data_models, file = "data_models.rda")
+```
+
+```{r}
+load(file = "data_final_up.rda")
+load(file = "data_prep.rda")
+load(file = "data_models.rda")
+```
+
+## SCM: full groups
+
+### Group 3 (emigrant)
+
+**Problema:** esta análise considera a amostra do grupo tratado com todas as unidades possíveis de controle, totalizando 871.583 observações.
+
+```{r}
+#| warning: false
+#| message: false
+df_g3_all <- data_models |>
+  filter(groups == "3") |> 
+  arrange(author_id, publication_year) |>
+  group_by(author_id) |>
+  mutate(previous_country = lag(country, order_by = publication_year)) |>
+  mutate(change_year = if_else(country != previous_country & !is.na(previous_country), publication_year, NA_real_)) |>
+  group_by(author_id) |>
+  mutate(first_change_year = min(change_year, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(period = if_else(publication_year < first_change_year, "Before Change", "After Change")) |>
+  select(-previous_country, -change_year) |>
+  filter(first_change_year %in% c(2010:2015)) |> # coment
+  mutate(treat = case_when(
+    period == 'Before Change' ~ 0,
+    TRUE ~ 1
+  )) |>
+  select(-c(first_change_year, period))
+
+df_g1 <- data_models |>
+  filter(groups == "1") |>
+  mutate(treat = 0)
+
+teste_scm <- df_g1 |>
+  full_join(df_g3_all) |>
+  mutate(sjr_winsorized = replace_na(sjr_winsorized, 0)) |>
+  mutate(sjr_mean = replace_na(sjr_mean, 0))
+
+out <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized + n_articles + n_citations, 
+              data = teste_scm,  index = c("author_id","publication_year"), 
+              se = TRUE, inference = "parametric", 
+              r = c(0, 5), CV = TRUE, force = "two-way", 
+              parallel = TRUE, min.T0 = 8, 
+              nboots = 1000, seed = 02139)
+
+plot(out, type = "missing")
+
+plot(out, type = "missing", 
+     main = "Treatment Status", id = out$id.tr, 
+     xlim = c(2000,2020),  axis.adjust=TRUE)
+
+plot(out, type = "gap")
+
+plot(out, type = "counterfactual", raw = "none", main="")
+
+```
+
+### Group 4 (returning migrant)
+
+**Problema:** esta análise considera a amostra do grupo tratado com todas as unidades possíveis de controle, totalizando 909.824 observações.
+
+```{r}
+#| warning: false
+#| message: false
+# Date when migration happens
+df_g4_all <- data_models |>
+  filter(groups == "4") |> 
+  arrange(author_id, publication_year) |>
+  group_by(author_id) |>
+  mutate(previous_country = lag(country, order_by = publication_year)) |>
+  mutate(change_year = if_else(country != previous_country & !is.na(previous_country), publication_year, NA_real_)) |>
+  group_by(author_id) |>
+  mutate(first_change_year = min(change_year, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(period = if_else(publication_year < first_change_year, "Before Change", "After Change")) |>
+  select(-previous_country, -change_year) |>
+  filter(first_change_year %in% c(2010:2015)) |> # coment
+  mutate(treat = case_when(
+    period == 'Before Change' ~ 0,
+    TRUE ~ 1
+  )) |>
+  select(-c(first_change_year, period))
+
+teste_scm2 <- df_g1 |>
+  full_join(df_g4_all) |>
+  mutate(sjr_winsorized = replace_na(sjr_winsorized, 0)) |>
+  mutate(sjr_mean = replace_na(sjr_mean, 0))
+
+out2 <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized + n_articles + n_citations,
+              data = teste_scm2,  index = c("author_id","publication_year"), 
+              se = TRUE, inference = "parametric", 
+              r = c(0, 5), CV = TRUE, force = "two-way", 
+              parallel = TRUE, min.T0 = 8, 
+              nboots = 1000, seed = 02139)
+
+plot(out, type = "gap")
+
+plot(out, type = "counterfactual", raw = "none", main="")
+
+```
+
+## SCM: authors with at least 1 publication per year
+
+**Problema:** esta análise considera a amostra do grupo tratado com apenas 5 pesquisadores (2010 a 2015).
+
+```{r}
+filtered_authors2 <- data_final_up |>
+  group_by(author_id, publication_year) |>
+  summarise(publications = n()) |>
+  spread(key = publication_year, value = publications, fill = 0) |>
+  filter_if(is.numeric, all_vars(. > 0)) |>
+  pull(author_id) 
+
+data_1py <- data_models |>
+  filter(author_id %in% filtered_authors2)
+
+data_1py |>
+  group_by(groups) |>
+  summarise(authors = n_distinct(author_id))
+```
+
+### Group 3 (emigrant)
+
+```{r}
+#| warning: false
+#| message: false
+df_g3_3 <- data_1py |>
+  filter(groups == "3") |> 
+  arrange(author_id, publication_year) |>
+  group_by(author_id) |>
+  mutate(previous_country = lag(country, order_by = publication_year)) |>
+  mutate(change_year = if_else(country != previous_country & !is.na(previous_country), publication_year, NA_real_)) |>
+  group_by(author_id) |>
+  mutate(first_change_year = min(change_year, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(period = if_else(publication_year < first_change_year, "Before Change", "After Change")) |>
+  select(-previous_country, -change_year) |>
+  filter(first_change_year %in% c(2010:2015)) |> # coment
+  mutate(treat = case_when(
+    period == 'Before Change' ~ 0,
+    TRUE ~ 1
+  )) |>
+  select(-c(first_change_year, period))
+
+df_g1_3 <- data_1py |>
+  filter(groups == "1") |>
+  mutate(treat = 0)
+
+# authors_to_sample <- sample(unique(df_g1_3$author_id), size = 2500, replace = FALSE)
+# 
+# df_g1_3 <- df_g1_3 |>
+#   filter(author_id %in% authors_to_sample)
+
+teste_scm5 <- df_g1_3 |>
+  full_join(df_g3_3) |>
+  mutate(sjr_winsorized = replace_na(sjr_winsorized, 0)) |>
+  mutate(sjr_mean = replace_na(sjr_mean, 0))
+
+out5 <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized + n_articles + n_citations,
+              data = teste_scm5,  index = c("author_id","publication_year"), 
+              se = TRUE, inference = "parametric", 
+              r = c(0, 5), CV = F, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 6, 
+              nboots = 100, seed = 02139)
+
+plot(out5, type = "gap")
+
+plot(out5, type = "counterfactual", raw = "none", main="")
+```
+
+### Group 4 (returning migrant)
+
+```{r}
+#| warning: false
+#| message: false
+df_g4_3 <- data_1py |>
+  filter(groups == "4") |> 
+  arrange(author_id, publication_year) |>
+  group_by(author_id) |>
+  mutate(previous_country = lag(country, order_by = publication_year)) |>
+  mutate(change_year = if_else(country != previous_country & !is.na(previous_country), publication_year, NA_real_)) |>
+  group_by(author_id) |>
+  mutate(first_change_year = min(change_year, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(period = if_else(publication_year < first_change_year, "Before Change", "After Change")) |>
+  select(-previous_country, -change_year) |>
+  filter(first_change_year %in% c(2010:2015)) |>
+  mutate(treat = case_when(
+    period == 'Before Change' ~ 0,
+    TRUE ~ 1
+  )) |>
+  select(-c(first_change_year, period))
+
+teste_scm6 <- df_g1_3 |>
+  full_join(df_g4_3) |>
+  mutate(sjr_winsorized = replace_na(sjr_winsorized, 0)) |>
+  mutate(sjr_mean = replace_na(sjr_mean, 0))
+
+out6 <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized + n_articles + n_citations,
+              data = teste_scm2,  index = c("author_id","publication_year"), 
+              se = TRUE, inference = "parametric", 
+              r = c(0, 5), CV = TRUE, force = "two-way", 
+              parallel = TRUE, min.T0 = 8, 
+              nboots = 1000, seed = 02139)
+
+plot(out6, type = "gap")
+
+plot(out6, type = "counterfactual", raw = "none", main="")
+
+```
+
+## SCM: sample of PSM
+
+### Group 3 (emigrant)
+
+Ano de mudança: 2010 a 2016
+
+Para visualizar o modelo basta carregar o arquivo `out7.rda` e `out7_2.rda`.
+
+```{r}
+df_g3_4 <- data_models |>
+  filter(groups == "3") |> 
+  arrange(author_id, publication_year) |>
+  group_by(author_id) |>
+  mutate(previous_country = lag(country, order_by = publication_year)) |>
+  mutate(change_year = if_else(country != previous_country & !is.na(previous_country), publication_year, NA_real_)) |>
+  group_by(author_id) |>
+  mutate(first_change_year = min(change_year, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(period = if_else(publication_year < first_change_year, "Before Change", "After Change")) |>
+  select(-previous_country, -change_year) |>
+  filter(first_change_year %in% c(2010:2016)) |> 
+  mutate(treat = case_when(
+    period == 'Before Change' ~ 0,
+    TRUE ~ 1
+  )) |>
+  select(-c(first_change_year, period)) |>
+  mutate(treat_psm = 1)
+  
+df_g1_4 <- data_models |>
+  filter(groups == "1") |>
+  mutate(treat = 0) |>
+  mutate(treat_psm = 0) 
+
+teste_scm7 <- df_g1_4 |>
+  full_join(df_g3_4) |>
+  mutate(sjr_winsorized = replace_na(sjr_winsorized, 0)) |>
+  mutate(sjr_mean = replace_na(sjr_mean, 0))
+
+teste_scm7_2 <- teste_scm7 |>
+  filter(publication_year <= 2009)
+
+df_nomiss = teste_scm7_2 |>
+  select(publication_year, treat, collab, sjr_winsorized, n_articles, n_citations, citations_winsorized, author_id, treat_psm) |>
+  na.omit()
+
+model = matchit(treat_psm ~ collab + citations_winsorized + n_citations + sjr_winsorized, method = "nearest", data = df_nomiss, ratio = 2) # + n_articles, ratio = 5
+
+# summary(model)
+
+# plot(model)
+
+pards1 = match.data(model)
+
+authors_psm <- pards1 |>
+  pull(author_id)
+
+data_psm <- teste_scm7 |>
+  filter(author_id %in% authors_psm)
+
+#drop outliers
+data_psm <- data_psm |>
+  filter(!(publication_year == 2000 & author_id == "6505850733" | publication_year == 2000 & author_id == "23027062000"))
+
+out7 <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized + n_articles, #+ n_citations + n_articles,
+              data = data_psm,  index = c("author_id","publication_year"), 
+              se = T, inference = "jackknife", # se = TRUE inf = parametric
+              r = c(0, 5), CV = T, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 100, seed = 02139) # nboots = 1000
+
+# save(out7, file = "out7.rda")
+
+load(file = "out7_t.rda")
+
+plot(out7_t, type = "gap")
+
+plot(out7_t, type = "counterfactual", raw = "none", main="")
+
+out7_2 <- gsynth(sjr_winsorized ~ treat + collab + citations_winsorized, # + n_articles + n_citations,
+              data = data_psm,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", # se = TRUE
+              r = c(0, 5), CV = F, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 6, 
+              nboots = 100, seed = 02139)
+
+# save(out7_2, file = "out7_2.rda")
+
+load(file = "out7_2.rda")
+
+plot(out7_2, type = "gap")
+
+plot(out7_2, type = "counterfactual", raw = "none", main="")
+
+out7_3 <- gsynth(collab ~ treat + sjr_winsorized + citations_winsorized, # + n_articles + n_citations,
+              data = data_psm,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", # se = TRUE
+              r = c(0, 5), CV = F, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 6, 
+              nboots = 100, seed = 02139)
+
+# save(out7_2, file = "out7_2.rda")
+
+out7$est.att
+
+# cummulative effect
+cumu1 <- cumuEff(out7_t2, cumu = TRUE, id = NULL)
+cumu1$est.catt
+
+# teste novo PSM
+df_nomiss_t <- teste_scm7_2 |>
+  select(publication_year, treat, collab, sjr_winsorized, n_articles, n_citations, citations_winsorized, author_id, treat_psm) |>
+  filter(publication_year > 2000) |>
+  na.omit()
+
+model_teste = matchit(treat_psm ~ collab + citations_winsorized + sjr_winsorized + n_articles, method = "nearest", data = df_nomiss_t, ratio = 1)# testar com 4 
+
+summary(model_teste)
+
+pards1_teste = match.data(model_teste)
+
+authors_psm_t <- pards1_teste |>
+  pull(author_id)
+
+data_psm_teste <- teste_scm7 |>
+  filter(author_id %in% authors_psm_t) |>
+  filter(publication_year > 2000)
+
+out7_t <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized, 
+              data = data_psm_teste,  index = c("author_id","publication_year"),
+              estimator = "mc", nlambda = 5,
+              se = T, inference = "nonparametric", # se = TRUE inf = parametric
+              r = c(0, 5), CV = T, force = "unit", # CV = T
+              parallel = TRUE, min.T0 = 5, 
+              nboots = 100, seed = 02139) # nboots = 1000
+
+round(out7_t3$est.att, 2) |> kable("pipe")
+
+out7_t2 <- gsynth(sjr_winsorized ~ treat + collab + citations_winsorized,
+              data = data_psm_teste,  index = c("author_id","publication_year"),
+              estimator = "mc", nlambda = 5,
+              se = T, inference = "nonparametric", # se = TRUE inf = parametric
+              r = c(0, 5), CV = T, force = "unit", # CV = T
+              parallel = TRUE, min.T0 = 5, 
+              nboots = 100, seed = 02139) # nboots = 1000
+
+round(out7_t2$est.att, 2)
+
+out7_t3 <- gsynth(collab ~ treat + sjr_winsorized + citations_winsorized,
+              data = data_psm_teste,  index = c("author_id","publication_year"),
+              estimator = "mc", nlambda = 5,
+              se = T, inference = "nonparametric", # se = TRUE inf = parametric
+              r = c(0, 5), CV = T, force = "unit", # CV = T
+              parallel = TRUE, min.T0 = 5, 
+              nboots = 100, seed = 02139) # nboots = 1000
+
+round(out7_t$est.att, 2)
+
+plot(out7_t3, type = "gap", main = "")
+
+plot(out7_t3, type = "counterfactual", raw = "none", main="", ylab = "Collaborations")
+
+data_psm_teste |> # data_psm_teste
+  group_by(groups) |>
+  summarise(n = n_distinct(author_id))
+
+save(out7_t3, file = "out7_t3.rda")
+load(file = "out7_t3.rda")
+
+round(sd(out7_t3$Y.bar[1:9,1]), 2) # media antes da intervencao
+round(sd(out7_t3$Y.bar[10:20,1]), 2) # media apos intervencao
+
+```
+
+### Group 4 (returning migrant)
+
+```{r}
+df_g4_4 <- data_models |>
+  filter(groups == "4") |> 
+  arrange(author_id, publication_year) |>
+  group_by(author_id) |>
+  mutate(previous_country = lag(country, order_by = publication_year)) |>
+  mutate(change_year = if_else(country != previous_country & !is.na(previous_country), publication_year, NA_real_)) |>
+  group_by(author_id) |>
+  mutate(first_change_year = min(change_year, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(period = if_else(publication_year < first_change_year, "Before Change", "After Change")) |>
+  select(-previous_country, -change_year) |>
+  filter(first_change_year %in% c(2010:2016)) |> # coment c(2010:2015)
+  mutate(treat = case_when(
+    period == 'Before Change' ~ 0,
+    TRUE ~ 1
+  )) |>
+  select(-c(first_change_year, period)) |>
+  mutate(treat_psm = 1)
+  
+teste_scm8 <- df_g1_4 |>
+  full_join(df_g4_4) |>
+  mutate(sjr_winsorized = replace_na(sjr_winsorized, 0)) |>
+  mutate(sjr_mean = replace_na(sjr_mean, 0))
+
+teste_scm8_2 <- teste_scm8 |>
+  filter(publication_year <= 2009)
+
+df_nomiss2 = teste_scm8_2 |>
+  select(publication_year, treat, collab, sjr_winsorized, n_articles, n_citations, citations_winsorized, author_id, treat_psm) |>
+  filter(publication_year > 2000) |>
+  na.omit()
+
+model2 = matchit(treat_psm ~ collab + citations_winsorized + n_articles + sjr_winsorized, method = "nearest", data = df_nomiss2, ratio = 1) 
+
+summary(model2)
+
+pards2 = match.data(model2)
+
+authors_psm2 <- pards2 |>
+  pull(author_id)
+
+data_psm2 <- teste_scm8 |>
+  filter(author_id %in% authors_psm2) |>
+  filter(publication_year > 2000)
+
+aut <- out8[["id.tr"]]
+
+data_psm3 <- data_psm2 |>
+  filter((treat == 1 & author_id %in% aut)|
+           (treat == 0 & author_id %in% authors_psm2))
+
+out8_t <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized, 
+              data = data_psm2,  index = c("author_id","publication_year"), 
+              estimator = "mc", lambda = 0.10, # nlambda = 5
+              se = T, inference = "nonparametric", 
+              r = 0, CV = F, force = "unit", 
+              parallel = TRUE, min.T0 = 5, 
+              nboots = 100, seed = 02139)
+
+round(out8_2$est.att, 2)
+
+out8_2 <- gsynth(sjr_winsorized ~ treat + collab + citations_winsorized, 
+              data = data_psm2,  index = c("author_id","publication_year"), 
+              estimator = "mc", lambda = 0.4216965, # 0.4216965
+              se = T, inference = "nonparametric", 
+              r = 0, CV = F, force = "unit", 
+              parallel = TRUE, min.T0 = 5, 
+              nboots = 100, seed = 02139)
+
+out8_3 <- gsynth(collab ~ treat + citations_winsorized + sjr_winsorized, 
+              data = data_psm2,  index = c("author_id","publication_year"), 
+              estimator = "mc", lambda = 0.17783, # nlambda = 5
+              se = T, inference = "nonparametric", 
+              r = 0, CV = F, force = "unit", 
+              parallel = TRUE, min.T0 = 5, 
+              nboots = 100, seed = 02139)
+
+# save(out8, file = "out8.rda")
+
+load(file = "out8.rda")
+
+plot(out8_3, type = "gap")
+
+plot(out8_3, type = "counterfactual", raw = "none", main="", ylab = "Collaborations")
+
+out8_2 <- gsynth(sjr_winsorized ~ treat + collab + citations_winsorized, # + n_articles + n_citations,
+              data = data_psm,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", # se = TRUE
+              r = c(0, 5), CV = F, force = "two-way", 
+              parallel = TRUE, min.T0 = 6, 
+              nboots = 100, seed = 02139)
+
+# save(out8_2, file = "out8_2.rda")
+
+load(file = "out8_2.rda")
+
+plot(out8_2, type = "gap")
+
+plot(out8_2, type = "counterfactual", raw = "none", main="")
+```
+
+```{r}
+# descriptive statistics - TABLE 2 (ARTICLE SCM)
+data_final_up <- data_final_up |>
+  group_by(publication_year) |>
+  mutate(citations_winsorized = Winsorize(cit_standard, probs = c(0, 0.99))) |>
+  mutate(sjr_winsorized = Winsorize(SJR, probs = c(0, 0.99), na.rm = T))
+
+data_final_up |>
+  group_by(groups_c) |>
+  summarise(
+    mean_citation = round(mean(citations_winsorized), 2),
+    sd_citation = round(sd(citations_winsorized), 2),
+    mean_sjr = round(mean(sjr_winsorized, na.rm = T), 2),
+    sd_sjr = round(sd(sjr_winsorized, na.rm = T), 2),
+    #mean_collab = round(mean(collab), 2),
+    #sd_collab = round(sd(collab), 2),
+    n_articles = n_distinct(eid),
+    n = n_distinct(author_id)
+  ) |> kable("pipe")
+
+teste_scm7 |>
+  filter(publication_year < 2010) |>
+  group_by(treat_psm) |>
+  summarise(cit = round(mean(citations_winsorized), 2),
+            sjr = round(mean(sjr_winsorized), 2),
+            col = round(mean(collab), 2),
+            aut = n_distinct(author_id)) |> kable("pipe")
+
+data_psm_teste |>
+  filter(publication_year < 2010) |>
+  group_by(treat_psm) |>
+  summarise(cit = round(mean(citations_winsorized), 2),
+            sjr = round(mean(sjr_winsorized), 2),
+            col = round(mean(collab), 2),
+            aut = n_distinct(author_id)) |> kable("pipe")
+
+df_g3_5n |>
+  filter(publication_year == 2000) |>
+  select(publication_year, SJR, author_id) |> view()
+  #summarise(m = mean(SJR, na.rm = T))
+  plot()
+
+plot(out9, type = "counterfactual", raw = "all")
+```
+
+## SCM: group mean
+
+### Group 3 (emigrant)
+
+Nova variável: série temporal com valores médios dos pesquisadores por ano.
+
+-   Valores médios por ano para cada grupo de mudança (2010 a 2016)
+
+```{r}
+df_g3_5n <- data_final_up |> 
+  filter(groups_c == "3") |> 
+  arrange(author_id, publication_year) |>
+  group_by(author_id) |>
+  mutate(previous_country = lag(country_year_pub, order_by = publication_year)) |>
+  mutate(change_year = if_else(country_year_pub != previous_country & !is.na(previous_country), publication_year, NA_real_)) |>
+  group_by(author_id) |>
+  mutate(first_change_year = min(change_year, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(period = if_else(publication_year < first_change_year, "Before Change", "After Change")) |>
+  select(-previous_country, -change_year) |>
+  filter(first_change_year %in% c(2010:2016)) |> # coment c(2010:2015)
+  mutate(treat = case_when(
+    period == 'Before Change' ~ 0,
+    TRUE ~ 1
+  )) |>
+  select(-period)
+
+# removendo outliers
+df_g3_5n <- df_g3_5n |>
+  filter(!(publication_year == 2000 & author_id == "6505850733" | publication_year == 2000 & author_id == "23027062000"))
+
+df_g3_52n <- df_g3_5n |>
+  group_by(publication_year, first_change_year) |>
+  summarise(articles = n_distinct(eid),
+            citations = mean(cit_standard), # antes aqui tava mean
+            citation_mean = mean(cit_standard),
+            citation_max = max(cit_standard),
+            sjr_mean = mean(SJR, na.rm = T),
+            sjr_max = max(SJR, na.rm = T),
+            groups = unique(groups_c),
+            collab = mean(foreign_country),
+            treat = unique(treat)) |> 
+  mutate(author_id = case_when(
+    first_change_year == 2010 ~ 110,
+    first_change_year == 2011 ~ 111,
+    first_change_year == 2012 ~ 112,
+    first_change_year == 2013 ~ 113,
+    first_change_year == 2014 ~ 114,
+    first_change_year == 2015 ~ 115,
+    first_change_year == 2016 ~ 116,
+    TRUE ~ 0
+  )) |>
+  mutate(treat_psm = 1) |>
+  group_by(first_change_year) |>
+  mutate(citations_winsorized = Winsorize(citation_mean, probs = c(0, 0.99))) |>
+  mutate(sjr_winsorized = Winsorize(sjr_mean, probs = c(0, 0.99), na.rm = T)) |>
+  select(-first_change_year)
+
+df_g1_5 <- data_final_up |>
+  filter(groups_c == "1") |>
+  group_by(author_id, publication_year) |>
+  summarise(articles = n_distinct(eid),
+            citations = mean(cit_standard), # antes aqui tava mean
+            citation_mean = mean(cit_standard),
+            citation_max = max(cit_standard),
+            sjr_mean = mean(SJR, na.rm = T),
+            sjr_max = max(SJR, na.rm = T),
+            groups = unique(groups_c),
+            collab = mean(foreign_country)) |> 
+  mutate(treat = 0) |>
+  mutate(treat_psm = 0)
+
+df_g1_5$author_id <- as.numeric(df_g1_5$author_id)
+
+df_g1_5 <- df_g1_5 |>
+  group_by(publication_year) |>
+  mutate(citations_winsorized = Winsorize(citation_mean, probs = c(0, 0.99))) |>
+  mutate(sjr_winsorized = Winsorize(sjr_mean, probs = c(0, 0.99), na.rm = T))
+
+teste_scm9 <- df_g1_5 |>
+  full_join(df_g3_52n) |>
+  mutate(citations_winsorized = replace_na(citations_winsorized, 0)) |>
+  mutate(sjr_winsorized = replace_na(sjr_winsorized, 0)) |>
+  mutate(sjr_mean = replace_na(sjr_mean, 0)) |>
+  mutate(sjr_max = replace_na(sjr_max, 0)) |>
+  select(-first_change_year)
+
+df_nomiss3 = teste_scm9 |>
+  na.omit()
+
+model3 = matchit(treat_psm ~ citations_winsorized + collab + sjr_winsorized +
+                  citations,
+                method = "nearest", data = df_nomiss3, ratio = 5)
+
+pards3 = match.data(model3)
+
+authors_psm3 <- pards3 |>
+  pull(author_id)
+
+data_psm3 <- teste_scm9 |>
+  filter(author_id %in% authors_psm3)
+
+out9 <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized, # antes tinha + citations
+              data = data_psm3,  index = c("author_id","publication_year"), 
+              se = TRUE, inference = "parametric", 
+              r = c(0, 5), CV = TRUE, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 1000, seed = 02139)
+
+save(out9, file = "out9.rda")
+
+load(file = "out9.rda")
+
+plot(out9, type = "missing", 
+     main = "Treatment Status", id = out9$id.tr, 
+     xlim = c(2000,2020),  axis.adjust=TRUE)
+
+plot(out9, type = "gap", main = "")
+
+plot(out9, type = "counterfactual", raw = "none", main="", ylab = "Citations")
+
+out9_2 <- gsynth(sjr_winsorized ~ treat + collab + citations_winsorized, # + citations,
+              data = data_psm3,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = T, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 1000, seed = 02139)
+
+save(out9_2, file = "out9_2.rda")
+
+load(file = "out9.rda")
+
+plot(out9_2, type = "missing", 
+     main = "Treatment Status", id = out9_2$id.tr, 
+     xlim = c(2000,2020),  axis.adjust=TRUE)
+
+plot(out9_2, type = "gap", main="")
+
+plot(out9_2, type = "counterfactual", raw = "none", main="", ylab = "SJR index")
+
+out9_3 <- gsynth(collab ~ treat + sjr_winsorized + citations_winsorized, # + citations,
+              data = data_psm3,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = T, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 1000, seed = 02139)
+
+save(out9_3, file = "out9_3.rda")
+
+load(file = "out9_3.rda")
+
+plot(out9_3, type = "gap", main="")
+
+plot(out9_3, type = "counterfactual", raw = "none", main="", ylab = "Collaboration")
+
+out9_3$est.att
+
+mean(out9$Y.bar[,1])
+
+round(out9$Y.bar,2) |> kable("pipe")
+# out9$est.ind
+
+out9$est.att
+
+# plot(out9, type = "loadings")
+# plot(out9, type = "factors", xlab="Year")
+# estatisticas para citations
+
+data_psm3 |>
+  ungroup() |>
+  filter(author_id %in% c(110:116)) |> 
+  group_by(treat) |>
+  summarise(cit = mean(citations_winsorized),
+            cit_sd = sd(citations_winsorized),
+            sjr = mean(sjr_winsorized),
+            sjr_sd = sd(sjr_winsorized),
+            col = mean(collab),
+            col_sd = sd(collab))
+
+```
+
+```{r}
+# descriptive statistics
+data_final_up <- data_final_up |>
+  group_by(publication_year) |>
+  mutate(citations_winsorized = Winsorize(cit_standard, probs = c(0, 0.99))) |>
+  mutate(sjr_winsorized = Winsorize(SJR, probs = c(0, 0.99), na.rm = T))
+
+data_final_up |>
+  group_by(groups_c) |>
+  summarise(
+    n_articles = n_distinct(eid),
+    n_citations = sum(citations_winsorized),
+    mean_citation = round(mean(citations_winsorized), 2),
+    sd_citation = round(sd(citations_winsorized), 2),
+    mean_sjr = round(mean(sjr_winsorized, na.rm = T), 2),
+    sd_sjr = round(sd(sjr_winsorized, na.rm = T), 2),
+    mean_collab = round(mean(foreign_country), 2),
+    sd_collab = round(sd(foreign_country), 2),
+    n = n_distinct(author_id)
+  ) |> kable("pipe")
+
+teste_scm9 |>
+  filter(publication_year < 2010) |>
+  group_by(treat_psm) |>
+  summarise(cit = mean(citations_winsorized),
+            sjr = mean(sjr_winsorized),
+            col = mean(collab),
+            aut = n_distinct(author_id)) |> kable("pipe")
+
+data_psm3 |>
+  filter(publication_year < 2010) |>
+  group_by(treat_psm) |>
+  summarise(cit = mean(citations_winsorized),
+            sjr = mean(sjr_winsorized),
+            col = mean(collab),
+            aut = n_distinct(author_id)) |> kable("pipe")
+
+df_g3_5n |>
+  filter(publication_year == 2000) |>
+  select(publication_year, SJR, author_id) |> view()
+  #summarise(m = mean(SJR, na.rm = T))
+  plot()
+
+plot(out9, type = "counterfactual", raw = "all")
+```
+
+### Group 4 (returning migrant)
+
+```{r}
+df_g4_5n <- data_final_up |> 
+  filter(groups_c == "4") |> 
+  arrange(author_id, publication_year) |>
+  group_by(author_id) |>
+  mutate(previous_country = lag(country_year_pub, order_by = publication_year)) |>
+  mutate(change_year = if_else(country_year_pub != previous_country & !is.na(previous_country), publication_year, NA_real_)) |>
+  group_by(author_id) |>
+  mutate(first_change_year = min(change_year, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(period = if_else(publication_year < first_change_year, "Before Change", "After Change")) |>
+  select(-previous_country, -change_year) |>
+  filter(first_change_year %in% c(2010:2016)) |> # coment c(2010:2015)
+  mutate(treat = case_when(
+    period == 'Before Change' ~ 0,
+    TRUE ~ 1
+  )) |>
+  select(-period)
+
+df_g4_52n <- df_g4_5n |>
+  group_by(publication_year, first_change_year) |>
+  summarise(articles = n_distinct(eid),
+            citations = mean(cit_standard), # antes aqui tava mean
+            citation_mean = mean(cit_standard),
+            citation_max = max(cit_standard),
+            sjr_mean = mean(SJR, na.rm = T),
+            sjr_max = max(SJR, na.rm = T),
+            groups = unique(groups_c),
+            collab = mean(foreign_country),
+            treat = unique(treat)) |> 
+  mutate(author_id = case_when(
+    first_change_year == 2010 ~ 110,
+    first_change_year == 2011 ~ 111,
+    first_change_year == 2012 ~ 112,
+    first_change_year == 2013 ~ 113,
+    first_change_year == 2014 ~ 114,
+    first_change_year == 2015 ~ 115,
+    first_change_year == 2016 ~ 116,
+    TRUE ~ 0
+  )) |>
+  mutate(treat_psm = 1) |>
+  group_by(first_change_year) |>
+  mutate(citations_winsorized = Winsorize(citation_mean, probs = c(0, 0.99))) |>
+  mutate(sjr_winsorized = Winsorize(sjr_mean, probs = c(0, 0.99), na.rm = T)) |>
+  select(-first_change_year)
+
+teste_scm10 <- df_g1_5 |>
+  full_join(df_g4_52n) |>
+  mutate(citations_winsorized = replace_na(citations_winsorized, 0)) |>
+  mutate(sjr_winsorized = replace_na(sjr_winsorized, 0)) |>
+  mutate(sjr_mean = replace_na(sjr_mean, 0)) |>
+  mutate(sjr_max = replace_na(sjr_max, 0)) |>
+  select(-first_change_year)
+
+df_nomiss4 = teste_scm10 |>
+  na.omit()
+
+model4 = matchit(treat_psm ~ citations_winsorized + collab + sjr_winsorized +
+                  citations,
+                method = "nearest", data = df_nomiss4, ratio = 5)
+
+pards4 = match.data(model4)
+
+authors_psm4 <- pards4 |>
+  pull(author_id)
+
+data_psm4 <- teste_scm10 |>
+  filter(author_id %in% authors_psm4)
+
+out10 <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized, # antes tinha + citations
+              data = data_psm4,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = T, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 1000, seed = 02139)
+
+save(out10, file = "out10.rda")
+
+load(file = "out10.rda")
+
+plot(out10, type = "missing", 
+     main = "Treatment Status", id = out10$id.tr, 
+     xlim = c(2000,2020),  axis.adjust=TRUE)
+
+plot(out10, type = "gap", main = "")
+
+plot(out10, type = "counterfactual", raw = "none", main="")
+
+out10_2 <- gsynth(sjr_winsorized ~ treat + collab + citations_winsorized,# + citations,
+              data = data_psm4,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = T, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 1000, seed = 02139)
+
+save(out10_2, file = "out10_2.rda")
+
+load(file = "out10_2.rda")
+
+plot(out10_2, type = "missing", 
+     main = "Treatment Status", id = out10_2$id.tr, 
+     xlim = c(2000,2020),  axis.adjust=TRUE)
+
+plot(out10_2, type = "gap", main = "")
+
+plot(out10_2, type = "counterfactual", raw = "none", main="")
+
+out10_3 <- gsynth(collab ~ treat + sjr_winsorized + citations_winsorized,# + citations,
+              data = data_psm4,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = T, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 1000, seed = 02139)
+
+save(out10_3, file = "out10_3.rda")
+
+load(file = "out10_3.rda")
+
+plot(out10_3, type = "gap", main = "")
+
+plot(out10_3, type = "counterfactual", raw = "none", main="")
+
+```
+
+-   Para um único ano (média da média).
+
+```{r}
+#| eval: false
+df_g3_5 <- data_models |> 
+  filter(groups == "3") |> 
+  arrange(author_id, publication_year) |>
+  group_by(author_id) |>
+  mutate(previous_country = lag(country, order_by = publication_year)) |>
+  mutate(change_year = if_else(country != previous_country & !is.na(previous_country), publication_year, NA_real_)) |>
+  group_by(author_id) |>
+  mutate(first_change_year = min(change_year, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(period = if_else(publication_year < first_change_year, "Before Change", "After Change")) |>
+  select(-previous_country, -change_year) |>
+  filter(first_change_year %in% c(2010:2015)) |> # coment c(2010:2015)
+  mutate(treat = case_when(
+    period == 'Before Change' ~ 0,
+    TRUE ~ 1
+  )) |>
+  select(-period)
+
+df_g3_52 <- df_g3_5 |>
+  group_by(publication_year, first_change_year) |>
+  summarise(articles = mean(n_articles),
+            citations = mean(n_citations),
+            citation_m = mean(citation_mean),
+            citation_w = mean(citations_winsorized, na.rm = T),
+            sjr_m = mean(sjr_mean, na.rm = T),
+            sjr_w = mean(sjr_winsorized, na.rm = T),
+            collab_s = mean(collab)) |> 
+  #filter(first_change_year == 2010) |> # somente mudanca em 2010
+  mutate(treat = case_when(
+    publication_year >= 2010 ~ 1,
+    TRUE ~ 0
+  )) |>
+  select(-first_change_year) |>
+  mutate(author_index = 1) |>
+  mutate(treat_psm = 1)
+
+df_g1_5 <- data_models |>
+  filter(groups == "1") |>
+  rename(articles = n_articles,
+         citations = n_citations,
+         citation_m = citation_mean,
+         citation_w = citations_winsorized,
+         sjr_m = sjr_mean,
+         sjr_w = sjr_winsorized,
+         collab_s = collab,
+         author_index = author_id
+         ) |>
+  select(c(articles, citations, citation_m, citation_w, sjr_m, sjr_w, collab_s, publication_year, author_index)) |>
+  mutate(treat = 0) |>
+  mutate(treat_psm = 0)
+
+df_g1_5$author_index <- as.numeric(df_g1_5$author_index)
+
+teste_scm9 <- df_g1_5 |>
+  full_join(df_g3_52) |>
+  mutate(sjr_w = replace_na(sjr_w, 0)) |>
+  mutate(sjr_m = replace_na(sjr_m, 0))
+
+df_nomiss2 = teste_scm9 |>
+  na.omit()
+
+model = matchit(treat_psm ~ citation_w + collab_s + sjr_w + articles + citations,
+                method = "nearest", data = df_nomiss2, ratio = 20)
+
+# summary(model)
+
+pards2 = match.data(model)
+
+authors_psm2 <- pards2 |>
+  pull(author_index)
+
+data_psm2 <- teste_scm9 |>
+  filter(author_index %in% authors_psm2)
+
+out9 <- gsynth(citation_w ~ treat + collab_s + sjr_w + articles + citations,
+              data = data_psm2,  index = c("author_index","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = F, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 6, 
+              nboots = 100, seed = 02139)
+
+plot(out9, type = "missing", 
+     main = "Treatment Status", id = out9$id.tr, 
+     xlim = c(2000,2020),  axis.adjust=TRUE)
+
+plot(out9, type = "gap")
+
+plot(out9, type = "counterfactual", raw = "none", main="")
+
+out9_2 <- gsynth(sjr_w ~ treat + collab_s + citation_w + articles + citations,
+              data = data_psm2,  index = c("author_index","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = F, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 6, 
+              nboots = 1000, seed = 02139)
+
+plot(out9_2, type = "missing")
+
+plot(out9_2, type = "missing", 
+     main = "Treatment Status", id = out9$id.tr, 
+     xlim = c(2000,2020),  axis.adjust=TRUE)
+
+plot(out9_2, type = "gap")
+
+plot(out9_2, type = "counterfactual", raw = "none", main="")
+
+```
+
+Aqui está uma análise com os dois grupos móveis (emigrantes e migrante de retorno).
+
+```{r}
+df_g4_52n <- df_g4_5n |>
+  group_by(publication_year, first_change_year) |>
+  summarise(articles = n_distinct(eid),
+            citations = mean(cit_standard), # antes aqui tava mean
+            citation_mean = mean(cit_standard),
+            citation_max = max(cit_standard),
+            sjr_mean = mean(SJR, na.rm = T),
+            sjr_max = max(SJR, na.rm = T),
+            groups = unique(groups_c),
+            collab = mean(foreign_country),
+            treat = unique(treat)) |> 
+  mutate(author_id = case_when(
+    first_change_year == 2010 ~ 210,
+    first_change_year == 2011 ~ 211,
+    first_change_year == 2012 ~ 212,
+    first_change_year == 2013 ~ 213,
+    first_change_year == 2014 ~ 214,
+    first_change_year == 2015 ~ 215,
+    first_change_year == 2016 ~ 216,
+    TRUE ~ 0
+  )) |>
+  mutate(treat_psm = 1) |>
+  group_by(first_change_year) |>
+  mutate(citations_winsorized = Winsorize(citation_mean, probs = c(0, 0.99))) |>
+  mutate(sjr_winsorized = Winsorize(sjr_mean, probs = c(0, 0.99), na.rm = T)) |>
+  select(-first_change_year)
+
+teste_scm11 <- teste_scm9 |>
+  full_join(df_g4_52n) |>
+  mutate(citations_winsorized = replace_na(citations_winsorized, 0)) |>
+  mutate(sjr_winsorized = replace_na(sjr_winsorized, 0)) |>
+  mutate(sjr_mean = replace_na(sjr_mean, 0)) |>
+  mutate(sjr_max = replace_na(sjr_max, 0)) |>
+  select(-first_change_year)
+
+df_nomiss5 = teste_scm10 |>
+  na.omit()
+
+model5 = matchit(treat_psm ~ citations_winsorized + collab + sjr_winsorized +
+                  citations,
+                method = "nearest", data = df_nomiss5, ratio = 5)
+
+pards5 = match.data(model5)
+
+authors_psm5 <- pards5 |>
+  pull(author_id)
+
+data_psm5 <- teste_scm10 |>
+  filter(author_id %in% authors_psm5)
+
+out11 <- gsynth(citations_winsorized ~ treat + collab + sjr_winsorized, # antes tinha + citations
+              data = data_psm5,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = T, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 1000, seed = 02139)
+
+save(out11, file = "out11.rda")
+
+load(file = "out11.rda")
+
+plot(out11, type = "missing", 
+     main = "Treatment Status", id = out11$id.tr, 
+     xlim = c(2000,2020),  axis.adjust=TRUE)
+
+plot(out11, type = "gap", main = "")
+
+plot(out11, type = "counterfactual", raw = "none", main="")
+
+out11_2 <- gsynth(sjr_winsorized ~ treat + collab + citations_winsorized,# + citations,
+              data = data_psm5,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = T, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 1000, seed = 02139)
+
+save(out11_2, file = "out11_2.rda")
+
+load(file = "out11_2.rda")
+
+plot(out11_2, type = "gap", main = "")
+
+plot(out11_2, type = "counterfactual", raw = "none", main="")
+
+out11_3 <- gsynth(collab ~ treat + sjr_winsorized + citations_winsorized,# + citations,
+              data = data_psm5,  index = c("author_id","publication_year"), 
+              se = T, inference = "parametric", 
+              r = c(0, 5), CV = T, force = "two-way", # CV = T
+              parallel = TRUE, min.T0 = 7, 
+              nboots = 1000, seed = 02139)
+
+save(out11_3, file = "out11_3.rda")
+
+load(file = "out11_3.rda")
+
+plot(out11_3, type = "gap", main = "", , ylim = c(-2,2))
+
+plot(out11_3, type = "counterfactual", raw = "none", main="")
+
+```
