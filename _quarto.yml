@@ -2,10 +2,6 @@ project:
   type: website
   output-dir: _site
 
-publish:
-  method: gh-pages
-  branch: gh-pages
-
 website:
   title: "Strategies for infer from a huge collection of bibliometric data"
   sidebar:
@@ -22,7 +18,6 @@ website:
 format:
   html:
     theme: cosmo
-    css: styles.css
     toc: true
 
 editor: visual
